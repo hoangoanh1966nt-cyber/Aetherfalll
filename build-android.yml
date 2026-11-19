@@ -1,0 +1,137 @@
+name: Aetherfall 0.7.0 Android Debug APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'Aetherfall_0.7.0_GDevelop_Project.zip'
+      - '.github/workflows/build-android.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    name: Export GDevelop HTML5 and build Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.16.0'
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'platform-tools'
+
+      - name: Validate source archive and extract project
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s Aetherfall_0.7.0_GDevelop_Project.zip
+          unzip -t Aetherfall_0.7.0_GDevelop_Project.zip
+          mkdir -p source
+          unzip -q Aetherfall_0.7.0_GDevelop_Project.zip -d source
+          test -s source/Aetherfall_0.7.0_GDevelop_Project/game.json
+
+      - name: Run source static tests
+        working-directory: source/Aetherfall_0.7.0_GDevelop_Project
+        run: |
+          set -euo pipefail
+          node --check scripts/runtime_event.js
+          node tests/mock_gdevelop_smoke.js
+          python3 -m pip install --disable-pip-version-check 'Pillow>=10.0'
+          python3 tools/verify_project.py
+
+      - name: Download GDevelop portable CLI
+        env:
+          GDEVELOP_VERSION: '5.6.287'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 \
+            "https://gdevelop-releases.s3.amazonaws.com/master/latest/gdevelop-${GDEVELOP_VERSION}.zip" \
+            --output gdevelop-portable.zip
+          mkdir -p gdevelop-portable
+          unzip -q gdevelop-portable.zip -d gdevelop-portable
+          GDEVELOP_BIN="$(find "$PWD/gdevelop-portable" -type f \( -name gdevelop -o -name GDevelop \) -print -quit)"
+          test -n "$GDEVELOP_BIN"
+          chmod +x "$GDEVELOP_BIN"
+          echo "GDEVELOP_BIN=$GDEVELOP_BIN" >> "$GITHUB_ENV"
+
+      - name: Export project to HTML5 using GDevelop CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT="$PWD/source/Aetherfall_0.7.0_GDevelop_Project/game.json"
+          "$GDEVELOP_BIN" --no-sandbox --disable-update-check --run-command EXPORT_HTML5_EXTERNAL "$PROJECT"
+          test -s "$PWD/source/Aetherfall_0.7.0_GDevelop_Project/build/index.html"
+
+      - name: Create Cordova Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global cordova@13.0.0
+          mkdir -p cordova-output
+          cd cordova-output
+          cordova create . com.aetherfall.echoeswild 'Aetherfall: Echoes of the Wild'
+          rm -rf www
+          mkdir -p www
+          cp -a "$GITHUB_WORKSPACE/source/Aetherfall_0.7.0_GDevelop_Project/build/." www/
+          cat > config.xml <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <widget id="com.aetherfall.echoeswild" version="0.7.0" xmlns="http://www.w3.org/ns/widgets" xmlns:cdv="http://cordova.apache.org/ns/1.0">
+            <name>Aetherfall: Echoes of the Wild</name>
+            <description>2D pixel action RPG with offline progression.</description>
+            <content src="index.html" />
+            <access origin="*" />
+            <allow-intent href="http://*/*" />
+            <allow-intent href="https://*/*" />
+            <preference name="Orientation" value="landscape" />
+            <preference name="Fullscreen" value="true" />
+            <preference name="DisallowOverscroll" value="true" />
+            <platform name="android">
+              <preference name="android-minSdkVersion" value="24" />
+              <preference name="android-targetSdkVersion" value="36" />
+              <preference name="android-compileSdkVersion" value="36" />
+            </platform>
+          </widget>
+          XML
+          cordova platform add android@15.0.0
+
+      - name: Build debug APK
+        working-directory: cordova-output
+        run: cordova build android --debug
+
+      - name: Verify and stage APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK='cordova-output/platforms/android/app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$APK"
+          mkdir -p release
+          cp "$APK" release/Aetherfall_0.7.0_DEBUG.apk
+          sha256sum release/Aetherfall_0.7.0_DEBUG.apk | tee release/SHA256SUMS.txt
+
+      - name: Upload debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aetherfall-0.7.0-debug-apk
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
