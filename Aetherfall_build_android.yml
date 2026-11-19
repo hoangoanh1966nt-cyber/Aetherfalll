@@ -1,0 +1,119 @@
+name: Build Aetherfall Android APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Aetherfall_0.7.0_GDevelop_Project.zip'
+      - '.github/workflows/build-android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 36
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      - name: Extract and identify GDevelop project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, zipfile
+          archive = "Aetherfall_0.7.0_GDevelop_Project.zip"
+          root = os.path.abspath("project-src")
+          os.makedirs(root, exist_ok=True)
+          with zipfile.ZipFile(archive) as z:
+              for info in z.infolist():
+                  target = os.path.abspath(os.path.join(root, info.filename))
+                  if os.path.commonpath([root, target]) != root:
+                      raise SystemExit("Unsafe path in project ZIP: " + info.filename)
+              z.extractall(root)
+          candidates = []
+          for base, _, names in os.walk(root):
+              for name in names:
+                  if name.lower().endswith(".json"):
+                      path = os.path.join(base, name)
+                      try:
+                          with open(path, encoding="utf-8") as f:
+                              data = json.load(f)
+                          if isinstance(data, dict) and "layouts" in data and "objects" in data:
+                              candidates.append(path)
+                      except (UnicodeDecodeError, json.JSONDecodeError, OSError):
+                          pass
+          if not candidates:
+              print("Extracted files:")
+              for base, _, names in os.walk(root):
+                  for name in names[:100]:
+                      print(os.path.join(base, name))
+              raise SystemExit("No GDevelop project JSON containing layouts and objects was found.")
+          candidates.sort(key=lambda p: (os.path.basename(p).lower() != "game.json", len(p)))
+          project = candidates[0]
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write("GAME_JSON=" + project + "\n")
+          print("GDevelop project found:", project)
+          PY
+
+      - name: Export GDevelop project to Cordova
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global gdexporter@4.0.0-beta7 cordova@13.0.0
+          gdexport --project "$GAME_JSON" --out "$RUNNER_TEMP/aetherfall-export" --build cordova --verbose
+          CONFIG_XML="$(find "$RUNNER_TEMP/aetherfall-export" -type f -name config.xml -print -quit)"
+          if [ -z "$CONFIG_XML" ]; then
+            echo "GDevelop exporter did not create a Cordova project (config.xml missing)."
+            find "$RUNNER_TEMP/aetherfall-export" -maxdepth 4 -type f | head -200 || true
+            exit 1
+          fi
+          echo "CORDOVA_DIR=$(dirname "$CONFIG_XML")" >> "$GITHUB_ENV"
+          echo "Cordova project: $(dirname "$CONFIG_XML")"
+
+      - name: Build Android debug APK
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$CORDOVA_DIR"
+          cordova platform add android@15.0.0
+          cordova build android --debug --verbose
+          APK="$(find "$CORDOVA_DIR/platforms/android" -type f -name 'app-debug.apk' -print -quit)"
+          if [ -z "$APK" ]; then
+            echo "Build completed but app-debug.apk was not found. Available APK files:"
+            find "$CORDOVA_DIR/platforms/android" -type f -name '*.apk' -print || true
+            exit 1
+          fi
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          ls -lh "$APK"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aetherfall-0.7.0-Android-APK
+          path: ${{ steps.build.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
